@@ -244,6 +244,11 @@ def load_data():
     df["MA20"] = df.groupby("Stock_Name")["Close"].transform(lambda x: x.rolling(20, min_periods=1).mean())
     df["MA50"] = df.groupby("Stock_Name")["Close"].transform(lambda x: x.rolling(50, min_periods=1).mean())
     df["Volatility"] = df.groupby("Stock_Name")["Daily_Return"].transform(lambda x: x.rolling(20, min_periods=1).std())
+    bb_std = df.groupby("Stock_Name")["Close"].transform(lambda x: x.rolling(20, min_periods=1).std())
+    df["BB_Upper"] = df["MA20"] + 2 * bb_std
+    df["BB_Lower"] = df["MA20"] - 2 * bb_std
+    df["Cum_Max"] = df.groupby("Stock_Name")["Close"].transform(lambda x: x.cummax())
+    df["Drawdown_Pct"] = (df["Close"] - df["Cum_Max"]) / df["Cum_Max"] * 100
     return df
 
 @st.cache_data(show_spinner=False)
@@ -256,9 +261,11 @@ def compute_stock_stats(df):
         Total_Volume=("Volume","sum"),
         Std_Close=("Close","std"),
         Start_Close=("Close","first"),
+        Max_Drawdown=("Drawdown_Pct","min"),
     ).reset_index()
     stats["Total_Return_Pct"] = ((stats["Latest_Close"] - stats["Start_Close"]) / stats["Start_Close"]) * 100
     stats["Volatility_Score"] = (stats["Std_Close"] / stats["Avg_Close"]) * 100
+    stats["Risk_Adj_Return"] = stats["Total_Return_Pct"] / stats["Volatility_Score"].replace(0, np.nan)
     return stats
 
 @st.cache_data(show_spinner=False)
@@ -308,6 +315,11 @@ with st.sidebar:
 
     st.markdown("**📊 Select Stock**")
     sel_stock = st.selectbox("", options=available_stocks if available_stocks else all_stocks, label_visibility="collapsed")
+
+    st.markdown("**⚖️ Compare Stocks** (optional, up to 6)")
+    compare_default = [s for s in available_stocks[:3] if s != sel_stock][:2]
+    compare_stocks = st.multiselect("", options=available_stocks, default=compare_default,
+                                     max_selections=6, label_visibility="collapsed")
 
     st.markdown("**📅 Date Range**")
     date_from = st.date_input("From", value=date_min, min_value=date_min, max_value=date_max, label_visibility="collapsed")
@@ -372,10 +384,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── TABS ─────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Stock Explorer",
     "🌍 Country Analytics",
     "📉 Market Overview",
+    "🔬 Risk & Comparison",
     "🗃️ Data Quality",
     "💡 Market Insights",
     "🏆 Portfolio",
@@ -447,7 +460,13 @@ with tab1:
                 mode="lines", name="MA 20", line=dict(color="#60a5fa", width=1.5, dash="dot")))
             fig.add_trace(go.Scatter(x=stock_df["Date"], y=stock_df["MA50"],
                 mode="lines", name="MA 50", line=dict(color="#fb923c", width=1.5, dash="dash")))
-            fig = apply_theme(fig, f"📈 {sel_stock} — Price & Moving Averages", 400)
+            fig.add_trace(go.Scatter(x=stock_df["Date"], y=stock_df["BB_Upper"],
+                mode="lines", name="BB Upper", line=dict(color="rgba(96,165,250,0.35)", width=1),
+                showlegend=True))
+            fig.add_trace(go.Scatter(x=stock_df["Date"], y=stock_df["BB_Lower"],
+                mode="lines", name="BB Lower", line=dict(color="rgba(96,165,250,0.35)", width=1),
+                fill="tonexty", fillcolor="rgba(96,165,250,0.06)", showlegend=True))
+            fig = apply_theme(fig, f"📈 {sel_stock} — Price, Moving Averages & Bollinger Bands", 400)
             st.plotly_chart(fig, use_container_width=True)
 
         with c2:
@@ -546,6 +565,16 @@ with tab2:
             height=380, coloraxis_showscale=False)
         st.plotly_chart(fig4, use_container_width=True)
 
+    # Treemap — Country > Stock volume hierarchy
+    st.markdown('<div class="section-header">🧩 Market Structure — Volume by Country & Stock</div>', unsafe_allow_html=True)
+    disp_stock_stats = stock_stats[stock_stats["Country"].isin(sel_countries)] if sel_countries else stock_stats
+    fig_tree = px.treemap(disp_stock_stats, path=["Country", "Stock_Name"], values="Total_Volume",
+        color="Total_Return_Pct", color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
+        labels={"Total_Return_Pct": "Total Return (%)"})
+    fig_tree.update_layout(**PLOTLY_THEME, title="Trading Volume Hierarchy — color = total return", height=500)
+    fig_tree.update_traces(textfont=dict(size=12))
+    st.plotly_chart(fig_tree, use_container_width=True)
+
     # Country stats table
     st.markdown('<div class="section-header">📋 Country Summary Table</div>', unsafe_allow_html=True)
     display_df = disp_cstats.copy()
@@ -605,9 +634,67 @@ with tab3:
     st.plotly_chart(fig4, use_container_width=True)
 
 # ════════════════════════════════════════════════════════════
-# TAB 4 – DATA QUALITY
+# TAB 4 – RISK & COMPARISON
 # ════════════════════════════════════════════════════════════
 with tab4:
+    st.markdown('<div class="section-header">⚖️ Normalized Multi-Stock Comparison</div>', unsafe_allow_html=True)
+
+    compare_list = compare_stocks if compare_stocks else [sel_stock]
+    fig_cmp = go.Figure()
+    palette = ["#a78bfa","#60a5fa","#34d399","#fb923c","#f472b6","#facc15"]
+    for i, s in enumerate(compare_list):
+        s_df = df[(df["Stock_Name"] == s) & (df["Date"] >= pd.Timestamp(date_from)) & (df["Date"] <= pd.Timestamp(date_to))].sort_values("Date")
+        if s_df.empty:
+            continue
+        base = s_df["Close"].iloc[0]
+        norm = (s_df["Close"] / base) * 100
+        fig_cmp.add_trace(go.Scatter(x=s_df["Date"], y=norm, mode="lines", name=s,
+            line=dict(color=palette[i % len(palette)], width=2)))
+    fig_cmp.add_hline(y=100, line_dash="dot", line_color="rgba(255,255,255,0.25)")
+    fig_cmp = apply_theme(fig_cmp, "Rebased Price Performance (Start = 100)", 420)
+    st.plotly_chart(fig_cmp, use_container_width=True)
+    st.markdown('<p style="color:rgba(255,255,255,0.4); font-size:0.8rem; margin-top:-0.8rem;">Add stocks to compare in the sidebar — all series rebased to 100 at the selected start date for a like-for-like view.</p>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown('<div class="section-header">📉 Drawdown Profile</div>', unsafe_allow_html=True)
+        dd_df = stock_df.dropna(subset=["Drawdown_Pct"])
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(x=dd_df["Date"], y=dd_df["Drawdown_Pct"],
+            mode="lines", name="Drawdown %", line=dict(color="#f87171", width=1.5),
+            fill="tozeroy", fillcolor="rgba(248,113,113,0.15)"))
+        fig_dd = apply_theme(fig_dd, f"{sel_stock} — Drop from Running Peak (%)", 380)
+        st.plotly_chart(fig_dd, use_container_width=True)
+        if stock_info is not None:
+            st.markdown(f'<p style="color:rgba(255,255,255,0.5); font-size:0.82rem; margin-top:-0.8rem;">Max drawdown over the period: <span style="color:#f87171; font-weight:700;">{stock_info["Max_Drawdown"]:.2f}%</span></p>', unsafe_allow_html=True)
+
+    with c2:
+        st.markdown('<div class="section-header">🏅 Risk-Adjusted Return Leaders</div>', unsafe_allow_html=True)
+        radj = stock_stats.dropna(subset=["Risk_Adj_Return"]).nlargest(15, "Risk_Adj_Return")
+        fig_radj = px.bar(radj.sort_values("Risk_Adj_Return"), x="Risk_Adj_Return", y="Stock_Name",
+            orientation="h", color="Risk_Adj_Return", color_continuous_scale="Blues",
+            labels={"Risk_Adj_Return": "Return ÷ Volatility"})
+        fig_radj.update_layout(**PLOTLY_THEME, title="Top 15 by Return per Unit of Volatility", height=380, coloraxis_showscale=False)
+        st.plotly_chart(fig_radj, use_container_width=True)
+        st.markdown('<p style="color:rgba(255,255,255,0.4); font-size:0.78rem; margin-top:-0.8rem;">A simplified Sharpe-style ratio — total return divided by the volatility score, not adjusted for a risk-free rate.</p>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">📅 Monthly Seasonality Heatmap</div>', unsafe_allow_html=True)
+    season_df = df_filtered.dropna(subset=["Daily_Return"]).copy()
+    season_df["Year"] = season_df["Date"].dt.year
+    season_df["Month"] = season_df["Date"].dt.strftime("%b")
+    month_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot_season = season_df.groupby(["Year","Month"])["Daily_Return"].mean().reset_index()
+    pivot_season = pivot_season.pivot(index="Year", columns="Month", values="Daily_Return").reindex(columns=month_order)
+    fig_season = px.imshow(pivot_season, color_continuous_scale="RdYlGn", aspect="auto",
+        labels=dict(color="Avg Daily Return (%)"), zmin=-abs(pivot_season.max().max() or 1), zmax=abs(pivot_season.max().max() or 1))
+    fig_season.update_layout(**PLOTLY_THEME, title="Average Daily Return by Month (filtered by sidebar countries)", height=320)
+    st.plotly_chart(fig_season, use_container_width=True)
+
+# ════════════════════════════════════════════════════════════
+# TAB 5 – DATA QUALITY
+# ════════════════════════════════════════════════════════════
+with tab5:
     st.markdown('<div class="section-header">🗃️ Dataset Summary & Quality Score</div>', unsafe_allow_html=True)
 
     missing_count = df.isnull().sum().sum()
@@ -671,9 +758,9 @@ with tab4:
         st.dataframe(schema_df, use_container_width=True)
 
 # ════════════════════════════════════════════════════════════
-# TAB 5 – MARKET INSIGHTS
+# TAB 6 – MARKET INSIGHTS
 # ════════════════════════════════════════════════════════════
-with tab5:
+with tab6:
     st.markdown('<div class="section-header">💡 Dynamic Market Insights</div>', unsafe_allow_html=True)
 
     # Auto-generate 12 insights
@@ -690,8 +777,10 @@ with tab5:
     tech_avg_ret      = stock_stats[stock_stats["Stock_Name"].isin(tech_stocks)]["Total_Return_Pct"].mean()
     overall_avg_ret   = stock_stats["Total_Return_Pct"].mean()
     top_vol_stock     = stock_stats.loc[stock_stats["Total_Volume"].idxmax()]
+    best_radj_stock   = stock_stats.dropna(subset=["Risk_Adj_Return"]).loc[stock_stats.dropna(subset=["Risk_Adj_Return"])["Risk_Adj_Return"].idxmax()]
+    deepest_dd_stock  = stock_stats.loc[stock_stats["Max_Drawdown"].idxmin()]
 
-    INSIGHT_COLORS = ["#a78bfa","#60a5fa","#34d399","#fb923c","#f472b6","#facc15","#2dd4bf","#e879f9","#a78bfa","#60a5fa","#34d399","#fb923c"]
+    INSIGHT_COLORS = ["#a78bfa","#60a5fa","#34d399","#fb923c","#f472b6","#facc15","#2dd4bf","#e879f9","#a78bfa","#60a5fa","#34d399","#fb923c","#60a5fa","#f87171"]
 
     insights = [
         ("🏆 Top Performer", f"{best_return_stock['Stock_Name']} leads with an outstanding {best_return_stock['Total_Return_Pct']:.2f}% total return over the analysis period.", INSIGHT_COLORS[0]),
@@ -706,6 +795,8 @@ with tab5:
         ("💻 Technology Sector", f"Tech stocks average {tech_avg_ret:.2f}% return, {'outperforming' if tech_avg_ret > overall_avg_ret else 'underperforming'} the broad market by {abs(tech_avg_ret-overall_avg_ret):.2f}%.", INSIGHT_COLORS[9]),
         ("📦 Volume Leader", f"{top_vol_stock['Stock_Name']} is the most actively traded stock with {top_vol_stock['Total_Volume']/1e9:.2f}B shares traded.", INSIGHT_COLORS[10]),
         ("🔢 Dataset Scale", f"With {total_rows:,} rows across {total_stocks} stocks and {total_countries} countries, this is an enterprise-grade multi-market dataset.", INSIGHT_COLORS[11]),
+        ("🏅 Best Risk-Adjusted Return", f"{best_radj_stock['Stock_Name']} delivers the strongest return per unit of volatility, at {best_radj_stock['Risk_Adj_Return']:.2f}x (Sharpe-style, not risk-free adjusted).", INSIGHT_COLORS[12]),
+        ("🕳️ Deepest Drawdown", f"{deepest_dd_stock['Stock_Name']} saw the steepest fall from its running peak at {deepest_dd_stock['Max_Drawdown']:.2f}%.", INSIGHT_COLORS[13]),
     ]
 
     st.markdown('<div class="insight-grid">', unsafe_allow_html=True)
@@ -761,9 +852,9 @@ with tab5:
     """, unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
-# TAB 6 – PORTFOLIO / RECRUITER
+# TAB 7 – PORTFOLIO / RECRUITER
 # ════════════════════════════════════════════════════════════
-with tab6:
+with tab7:
     st.markdown('<div class="section-header">🏆 What This Dashboard Demonstrates</div>', unsafe_allow_html=True)
     st.markdown('<p style="color:rgba(255,255,255,0.55); margin-bottom:1.5rem;">This dashboard showcases a professional-grade financial analytics platform built with Python, Streamlit, and Plotly — reflecting skills across data engineering, analytics, and full-stack BI development.</p>', unsafe_allow_html=True)
 
@@ -788,6 +879,12 @@ with tab6:
         "✅ Multi-Country Analytics",
         "✅ Dynamic Insights Engine",
         "✅ Production Code Quality",
+        "✅ Bollinger Bands",
+        "✅ Drawdown Analysis",
+        "✅ Risk-Adjusted Returns",
+        "✅ Seasonality Heatmaps",
+        "✅ Multi-Stock Comparison",
+        "✅ Treemap Visualization",
     ]
     badge_html = " ".join([f'<span class="badge">{b}</span>' for b in badges])
     st.markdown(f'<div class="badge-grid">{badge_html}</div>', unsafe_allow_html=True)
