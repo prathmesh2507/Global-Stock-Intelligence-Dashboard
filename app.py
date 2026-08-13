@@ -335,7 +335,7 @@ stock_info = stock_stats[stock_stats["Stock_Name"] == sel_stock].iloc[0] if not 
 # ── HERO BANNER ──────────────────────────────────────────────
 st.markdown("""
 <div class="hero-banner">
-    <div class="hero-title">Stock Intelligence Dashboard</div>
+    <div class="hero-title">📈 Stock Intelligence Dashboard</div>
     <div class="hero-subtitle">Interactive Financial Intelligence Platform · Real-Time Insights · 300+ Stocks · 20 Markets</div>
 </div>
 """, unsafe_allow_html=True)
